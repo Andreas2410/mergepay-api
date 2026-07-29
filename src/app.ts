@@ -32,6 +32,8 @@ function securityKey(request: FastifyRequest): string {
 }
 
 export async function buildApp(): Promise<FastifyInstance> {
+  validateAssetConfig();
+
   const app = Fastify({
     // Disable Fastify's unvalidated request-id header handling. The incoming
     // values are validated by genReqId before becoming request.id.

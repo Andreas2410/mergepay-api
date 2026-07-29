@@ -9,6 +9,7 @@ import { anchorService, mapAnchorStatus } from "../services/anchor";
 import { audit } from "../services/audit";
 import { ipKey } from "../services/rate-limit-keys";
 import { serializeAnchorSession } from "../serializers";
+import { validateAsset } from "../services/assets";
 
 export default async function anchorRoutes(app: FastifyInstance) {
   // -- list anchors (public-ish, but behind auth for consistency) -------------
@@ -52,6 +53,9 @@ export default async function anchorRoutes(app: FastifyInstance) {
     const body = z
       .object({ assetCode: z.string().min(1), anchorName: z.string().optional() })
       .parse(req.body);
+
+    // Validate that the requested asset is supported.
+    validateAsset(body.assetCode);
 
     const t = await anchorService.getToml(config.ANCHOR_HOME_DOMAIN);
     const challenge = await anchorService.getChallenge(

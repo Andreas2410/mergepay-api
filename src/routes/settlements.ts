@@ -20,6 +20,7 @@ import {
   loadGroupBalancesWithSuggestions,
   groupPrimaryAsset,
 } from "../services/group-balances";
+import { validateAsset, validateAmount } from "../services/assets";
 import { memoText } from "../services/stellar";
 
 const settlementInclude = { from: true, to: true } as const;
@@ -137,6 +138,9 @@ export default async function settlementRoutes(app: FastifyInstance) {
         assetIssuer: z.string().nullable().optional(),
       })
       .parse(req.body);
+
+    validateAmount(body.amount);
+    validateAsset(body.assetCode, body.assetIssuer ?? null);
 
     if (body.toUserId === auth.id) {
       throw Errors.badRequest("self_settle", "You cannot settle with yourself");
