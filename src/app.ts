@@ -128,6 +128,17 @@ export async function buildApp(): Promise<FastifyInstance> {
         },
     credentials: false,
   });
+  // Global default limit. Sensitive routes (SEP-10 auth, settlement
+  // submission, the SEP-24 callback) override this with their own,
+  // route-appropriate config — see routes/auth.ts, routes/settlements.ts,
+  // routes/anchors.ts. Keys are the authenticated user id when available,
+  // otherwise the resolved client IP — never a wallet public key.
+  //
+  // RATE_LIMIT_STORE=database shares counters across instances via Postgres
+  // (src/services/rate-limit-store.ts) and fails OPEN if that store errors
+  // (skipOnError), so a database hiccup degrades to "unlimited" rather than
+  // blocking all traffic. The default "memory" store is per-process and
+  // needs no failure handling of its own.
   await app.register(rateLimit, {
     max: 100,
     timeWindow: config.RATE_LIMIT_WINDOW_MS,
