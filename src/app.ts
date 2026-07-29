@@ -1,4 +1,4 @@
-import Fastify, { FastifyInstance } from "fastify";
+import Fastify, { FastifyInstance, FastifyRequest } from "fastify";
 import cors from "@fastify/cors";
 import helmet from "@fastify/helmet";
 import rateLimit from "@fastify/rate-limit";
@@ -6,6 +6,7 @@ import multipart from "@fastify/multipart";
 import fastifyStatic from "@fastify/static";
 import path from "node:path";
 import { config } from "./config";
+import { verifyToken } from "./plugins/auth";
 import authPlugin from "./plugins/auth";
 import errorHandlerPlugin from "./plugins/error-handler";
 import authRoutes from "./routes/auth";
@@ -17,6 +18,18 @@ import anchorRoutes from "./routes/anchors";
 import historyRoutes from "./routes/history";
 import uploadRoutes from "./routes/uploads";
 import { getCorrelationId } from "./lib/correlation";
+
+function securityKey(request: FastifyRequest): string {
+  const authorization = request.headers.authorization;
+  if (authorization?.startsWith("Bearer ")) {
+    try {
+      return `user:${verifyToken(authorization.slice("Bearer ".length).trim()).id}`;
+    } catch {
+      // Invalid credentials are deliberately grouped by client IP.
+    }
+  }
+  return `ip:${request.ip}`;
+}
 
 export async function buildApp(): Promise<FastifyInstance> {
   const app = Fastify({
@@ -58,7 +71,7 @@ export async function buildApp(): Promise<FastifyInstance> {
               ? { target: "pino-pretty", options: { colorize: true } }
               : undefined,
         },
-    bodyLimit: 6 * 1024 * 1024,
+    bodyLimit: config.MULTIPART_FILE_SIZE_BYTES + 64 * 1024,
   });
 
   app.addHook("onRequest", async (request, reply) => {
@@ -117,11 +130,67 @@ export async function buildApp(): Promise<FastifyInstance> {
   });
   await app.register(rateLimit, {
     max: 100,
-    timeWindow: "1 minute",
-    allowList: config.isTest ? () => true : undefined,
+    timeWindow: config.RATE_LIMIT_WINDOW_MS,
+    keyGenerator: securityKey,
+    addHeaders: true,
+    errorResponseBuilder: (request) => ({
+      error: "RATE_LIMITED",
+      message: "Too many requests. Please retry later.",
+      statusCode: 429,
+      requestId: request.id,
+    }),
   });
   await app.register(multipart, {
-    limits: { fileSize: 6 * 1024 * 1024, files: 1 },
+    limits: {
+      fileSize: config.MULTIPART_FILE_SIZE_BYTES,
+      files: 1,
+      parts: 10,
+    },
+  });
+
+  // Apply stricter policies only to expensive or abuse-prone endpoints.
+  app.addHook("onRoute", (routeOptions) => {
+    const url = routeOptions.url;
+    let max: number | undefined;
+    let bodyLimit: number | undefined;
+
+    if (url === "/auth/challenge" || url === "/auth/verify") {
+      max = config.AUTH_RATE_LIMIT_MAX;
+      bodyLimit = config.AUTH_BODY_LIMIT_BYTES;
+    } else if (
+      url === "/expenses/:id/settle" ||
+      url === "/groups/:id/settlements" ||
+      url === "/settlements/:id/submit"
+    ) {
+      max = config.SETTLEMENT_RATE_LIMIT_MAX;
+      bodyLimit = config.AUTH_BODY_LIMIT_BYTES;
+    } else if (
+      url === "/anchors/deposit" ||
+      url === "/anchors/withdraw" ||
+      url === "/anchors/sessions/:id/complete" ||
+      url === "/uploads/receipt"
+    ) {
+      max = config.SEP24_RATE_LIMIT_MAX;
+      bodyLimit = url === "/uploads/receipt"
+        ? config.MULTIPART_FILE_SIZE_BYTES + 64 * 1024
+        : config.AUTH_BODY_LIMIT_BYTES;
+    }
+
+    if (max !== undefined) {
+      const options = routeOptions as typeof routeOptions & {
+        config?: Record<string, unknown>;
+        bodyLimit?: number;
+      };
+      options.config = {
+        ...(options.config ?? {}),
+        rateLimit: {
+          max,
+          timeWindow: config.RATE_LIMIT_WINDOW_MS,
+          keyGenerator: securityKey,
+        },
+      };
+      options.bodyLimit = bodyLimit;
+    }
   });
 
   await app.register(fastifyStatic, {
