@@ -370,9 +370,18 @@ async function reconcileSingleAnchor(
       data.status = "error";
     }
 
-    await prisma.anchorSession.update({
-      where: { id: session.id },
-      data: data as any,
+    await prisma.$transaction(async (tx) => {
+      await tx.anchorSession.update({
+        where: { id: session.id },
+        data: data as any,
+      });
+      await recordStatusTransitionInTransaction(tx, {
+        entityType: "anchor_session",
+        entityId: session.id,
+        newStatus: "error",
+        reason: result.message,
+        source: "worker",
+      });
     });
 
     if (!shouldBackoff) {
@@ -445,9 +454,18 @@ async function reconcileSingleAnchor(
     );
   }
 
-  await prisma.anchorSession.update({
-    where: { id: session.id },
-    data: updateData as any,
+  await prisma.$transaction(async (tx) => {
+    await tx.anchorSession.update({
+      where: { id: session.id },
+      data: updateData as any,
+    });
+    await recordStatusTransitionInTransaction(tx, {
+      entityType: "anchor_session",
+      entityId: session.id,
+      newStatus: result.status,
+      reason: result.status === "error" ? (result.message ?? null) : undefined,
+      source: "worker",
+    });
   });
 
   jobLog.info(
@@ -547,5 +565,11 @@ export function startWorker(): () => void {
 }
 
 if (process.env.NODE_ENV !== "test") {
+  // Config validation already happened at module load time in config.ts
+  // This explicit check ensures we fail before starting the worker if config is invalid
+  if (!config.DATABASE_URL || !config.HORIZON_URL || !config.ANCHOR_HOME_DOMAIN) {
+    console.error("❌ Critical configuration missing for worker. Exiting.");
+    process.exit(1);
+  }
   startWorker();
 }

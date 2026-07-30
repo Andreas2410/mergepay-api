@@ -23,7 +23,7 @@ import { validateAsset, validateAmount } from "../services/assets";
 import { memoText, validateSignedXdr } from "../services/stellar";
 import { readIdempotencyKey, runIdempotent } from "../services/idempotency";
 
-const settlementInclude = { from: true, to: true } as const;
+const settlementInclude = { from: true, to: true, statusHistory: true } as const;
 
 export default async function settlementRoutes(app: FastifyInstance) {
   app.addHook("preHandler", app.authenticate);
@@ -120,6 +120,13 @@ export default async function settlementRoutes(app: FastifyInstance) {
           include: settlementInclude,
         });
 
+        await recordStatusTransitionInTransaction(tx, {
+          entityType: "settlement",
+          entityId: settlement.id,
+          newStatus: "pending",
+          source: "api",
+        });
+
         await tx.expenseShare.update({
           where: { id: myShare.id },
           data: { status: "settling" },
@@ -191,6 +198,13 @@ export default async function settlementRoutes(app: FastifyInstance) {
             memo: memoText(code),
           },
           include: settlementInclude,
+        });
+
+        await recordStatusTransitionInTransaction(tx, {
+          entityType: "settlement",
+          entityId: settlement.id,
+          newStatus: "pending",
+          source: "api",
         });
 
         const xdr = await buildSettlementXdr({
@@ -313,6 +327,15 @@ export default async function settlementRoutes(app: FastifyInstance) {
             failureReason: null,
           },
         });
+
+        if (count > 0) {
+          await recordStatusTransitionInTransaction(tx, {
+            entityType: "settlement",
+            entityId: id,
+            newStatus: "submitted",
+            source: "api",
+          });
+        }
 
         const finalSettlement = await tx.settlement.findUniqueOrThrow({
           where: { id },
