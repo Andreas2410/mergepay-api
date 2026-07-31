@@ -12,6 +12,7 @@ import {
   Account,
   Asset,
   BASE_FEE,
+  FeeBumpTransaction,
   Horizon,
   Keypair,
   Memo,
