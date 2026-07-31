@@ -8,15 +8,41 @@ import { requireUser } from "../plugins/auth";
 import { anchorService, mapAnchorStatus } from "../services/anchor";
 import { applyAnchorSessionTransition } from "../services/anchor-status";
 import { audit } from "../services/audit";
-import { ipKey } from "../services/rate-limit-keys";
+import { rateLimited } from "../lib/rate-limit";
+import {
+  buildPage,
+  cursorFilter,
+  cursorOrderBy,
+  paginationQuerySchema,
+  requireCursor,
+  takeForPage,
+} from "../lib/pagination";
 import { serializeAnchorSession } from "../serializers";
 import { validateAsset } from "../services/assets";
 import { paginationQuerySchema, encodeCursor, decodeCursor } from "../lib/pagination";
 import { recordStatusTransition } from "../services/status-history";
 
 export default async function anchorRoutes(app: FastifyInstance) {
+  // Every anchor route that reaches an anchor gets an explicit budget so a
+  // client cannot amplify one Mergepay request into unbounded upstream ones.
+  //
+  //  - anchorInit  — deposit/withdraw start and interactive completion. Each
+  //    call fans out to stellar.toml + SEP-10 + SEP-24, so it is the tightest
+  //    policy in the API.
+  //  - anchorPoll  — status reads. Cheaper, but still upstream-amplifying (or,
+  //    for the DB-backed session list, the endpoint clients poll in a loop).
+  //
+  // Both are keyed by the authenticated user, so one caller can never exhaust
+  // another's budget. The webhook is keyed by IP because it is authenticated
+  // by shared secret rather than a session.
+  const initLimit = rateLimited("anchorInit");
+  const pollLimit = rateLimited("anchorPoll");
+
   // -- list anchors (public-ish, but behind auth for consistency) -------------
-  app.get("/anchors", { preHandler: [app.authenticate] }, async () => {
+  app.get(
+    "/anchors",
+    { preHandler: [app.authenticate], ...pollLimit },
+    async () => {
     try {
       const t = await anchorService.getToml(config.ANCHOR_HOME_DOMAIN);
       return {
@@ -48,7 +74,8 @@ export default async function anchorRoutes(app: FastifyInstance) {
         ],
       };
     }
-  });
+  }
+  );
 
   // -- start deposit / withdraw -----------------------------------------------
   async function start(kind: "deposit" | "withdrawal", req: any) {
@@ -88,17 +115,17 @@ export default async function anchorRoutes(app: FastifyInstance) {
     };
   }
 
-  app.post("/anchors/deposit", { preHandler: [app.authenticate] }, (req) =>
+  app.post("/anchors/deposit", { preHandler: [app.authenticate], ...initLimit }, (req) =>
     start("deposit", req)
   );
-  app.post("/anchors/withdraw", { preHandler: [app.authenticate] }, (req) =>
+  app.post("/anchors/withdraw", { preHandler: [app.authenticate], ...initLimit }, (req) =>
     start("withdrawal", req)
   );
 
   // -- complete (exchange signed challenge for interactive url) ---------------
   app.post(
     "/anchors/sessions/:id/complete",
-    { preHandler: [app.authenticate] },
+    { preHandler: [app.authenticate], ...initLimit },
     async (req) => {
       const auth = requireUser(req);
       const { id } = z.object({ id: z.string() }).parse(req.params);
@@ -239,6 +266,13 @@ export default async function anchorRoutes(app: FastifyInstance) {
             });
           }
         });
+        for (const session of sessions) {
+          await applyAnchorSessionTransition({
+            sessionId: session.id,
+            nextStatus: mapAnchorStatus(status),
+            source: "webhook",
+          });
+        }
       }
       return reply.code(200).send({ ok: true });
     }

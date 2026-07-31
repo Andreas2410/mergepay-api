@@ -4,6 +4,7 @@ import { prisma } from "../db";
 import { config } from "../config";
 import { Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
+import { rateLimited } from "../lib/rate-limit";
 import { serializeExpense, serializeSettlement } from "../serializers";
 import { paginationQuerySchema, decodeCursor, buildPaginatedResponse } from "../services/pagination";
 import { paginationQuerySchema, encodeCursor, decodeCursor } from "../lib/pagination";

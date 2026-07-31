@@ -22,17 +22,29 @@ import withdrawalRoutes from "./routes/withdraw";
 import historyRoutes from "./routes/history";
 import uploadRoutes from "./routes/uploads";
 import { getCorrelationId } from "./lib/correlation";
+import { rateLimitPolicies } from "./lib/rate-limit";
+import { validateAssetConfig } from "./services/assets";
+import { PrismaRateLimitStore } from "./services/rate-limit-store";
+import { getReadiness } from "./services/health";
 
-function securityKey(request: FastifyRequest): string {
+/**
+ * Global-policy key. Unlike the per-route policies (which run on `preHandler`
+ * and can read `req.user`), the global limiter runs on `onRequest`, before any
+ * route's authenticate hook, so it resolves the identity from the bearer token
+ * itself. An unparseable token deliberately falls back to the client IP so
+ * invalid credentials share one bucket instead of minting a fresh one each try.
+ */
+function globalRateLimitKey(request: FastifyRequest): string {
   const authorization = request.headers.authorization;
   if (authorization?.startsWith("Bearer ")) {
     try {
-      return `user:${verifyToken(authorization.slice("Bearer ".length).trim()).id}`;
+      const user = verifyToken(authorization.slice("Bearer ".length).trim());
+      return `global:user:${user.id}`;
     } catch {
       // Invalid credentials are deliberately grouped by client IP.
     }
   }
-  return `ip:${request.ip}`;
+  return `global:ip:${request.ip}`;
 }
 
 export async function buildApp(): Promise<FastifyInstance> {
@@ -132,11 +144,11 @@ export async function buildApp(): Promise<FastifyInstance> {
         },
     credentials: false,
   });
-  // Global default limit. Sensitive routes (SEP-10 auth, settlement
-  // submission, the SEP-24 callback) override this with their own,
-  // route-appropriate config — see routes/auth.ts, routes/settlements.ts,
-  // routes/anchors.ts. Keys are the authenticated user id when available,
-  // otherwise the resolved client IP — never a wallet public key.
+  // Global default limit. Sensitive routes (SEP-10 auth, settlement and
+  // treasury submission, anchor initiation and polling) override this with
+  // their own bucket — see src/lib/rate-limit.ts for the policy table and the
+  // routes that name each policy. Keys are the authenticated user id when
+  // available, otherwise the resolved client IP — never a wallet public key.
   //
   // RATE_LIMIT_STORE=database shares counters across instances via Postgres
   // (src/services/rate-limit-store.ts) and fails OPEN if that store errors
@@ -162,7 +174,26 @@ export async function buildApp(): Promise<FastifyInstance> {
     },
   });
 
-  // Apply stricter policies only to expensive or abuse-prone endpoints.
+  // Cap the request body on routes that take signed envelopes or credentials,
+  // so a malformed or hostile payload is rejected by Fastify before any Zod
+  // parsing, cryptographic work, or upstream call happens. Rate-limit policy
+  // is *not* set here — each route names its own policy from
+  // src/lib/rate-limit.ts, which keeps the limit next to the handler it guards.
+  const BODY_LIMITED_ROUTES = new Set([
+    "/auth/challenge",
+    "/auth/verify",
+    "/expenses/:id/settle",
+    "/groups/:id/settlements",
+    "/settlements/:id/confirm",
+    "/groups/:id/treasury/deposit",
+    "/groups/:id/treasury/withdraw",
+    "/treasury-transactions/:id/confirm",
+    "/anchors/deposit",
+    "/anchors/withdraw",
+    "/anchors/sessions/:id/complete",
+    "/anchors/webhook",
+  ]);
+
   app.addHook("onRoute", (routeOptions) => {
     const url = routeOptions.url;
     let max: number | undefined;
@@ -190,20 +221,10 @@ export async function buildApp(): Promise<FastifyInstance> {
         : config.AUTH_BODY_LIMIT_BYTES;
     }
 
-    if (max !== undefined) {
-      const options = routeOptions as typeof routeOptions & {
-        config?: Record<string, unknown>;
-        bodyLimit?: number;
-      };
-      options.config = {
-        ...(options.config ?? {}),
-        rateLimit: {
-          max,
-          timeWindow: config.RATE_LIMIT_WINDOW_MS,
-          keyGenerator: securityKey,
-        },
-      };
-      options.bodyLimit = bodyLimit;
+    if (url === "/uploads/receipt") {
+      options.bodyLimit = config.MULTIPART_FILE_SIZE_BYTES + 64 * 1024;
+    } else if (BODY_LIMITED_ROUTES.has(url)) {
+      options.bodyLimit = config.AUTH_BODY_LIMIT_BYTES;
     }
   });
 

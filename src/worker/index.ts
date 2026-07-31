@@ -2,6 +2,8 @@ import pino from "pino";
 import { randomUUID } from "crypto";
 import { config } from "../config";
 import { prisma } from "../db";
+import { AppError } from "../errors";
+import { isIntentExpired } from "../lib/time-bounds";
 import { stellar } from "../services/stellar";
 import { audit } from "../services/audit";
 import { AppError } from "../errors";
@@ -215,7 +217,8 @@ async function processSettlement(
     }
 
     const initialAttempt = Math.max(1, settlement.retryCount);
-    const remainingAttempts = Math.max(1, SETTLEMENT_MAX_RETRIES - initialAttempt + 1);
+    const maxAttempts = SETTLEMENT_MAX_RETRIES + 1;
+    const remainingAttempts = Math.max(1, maxAttempts - initialAttempt + 1);
 
     for (let offset = 0; offset < remainingAttempts; offset += 1) {
       const attempt = initialAttempt + offset;

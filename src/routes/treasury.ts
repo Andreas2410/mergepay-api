@@ -9,6 +9,14 @@ import { requireMembership, requireAdmin } from "../services/access";
 import { stellar, memoText } from "../services/stellar";
 import { shortCode } from "../services/codes";
 import { audit } from "../services/audit";
+import { validateAsset, validateAmount } from "../services/assets";
+import { rateLimited } from "../lib/rate-limit";
+import {
+  assertIntentNotExpired,
+  intentExpiry,
+  intentValiditySchema,
+  secondsUntilExpiry,
+} from "../lib/time-bounds";
 import { serializeGroup, serializeTreasuryTx } from "../serializers";
 import { paginationQuerySchema, encodeCursor, decodeCursor } from "../lib/pagination";
 import { validateAmount, validateAsset } from "../services/assets";
@@ -142,7 +150,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
   });
 
   // -- deposit ----------------------------------------------------------------
-  app.post("/groups/:id/treasury/deposit", async (req) => {
+  app.post("/groups/:id/treasury/deposit", rateLimited("settlementCreate"), async (req) => {
     const auth = requireUser(req);
     const { id } = z.object({ id: z.string() }).parse(req.params);
     await requireMembership(id, auth.id);
@@ -151,6 +159,9 @@ export default async function treasuryRoutes(app: FastifyInstance) {
         amount: z.string().min(1),
         assetCode: z.string().min(1),
         assetIssuer: z.string().nullable().optional(),
+        // A client may ask for a shorter signing window; the server clock still
+        // decides the deadline.
+        validitySeconds: intentValiditySchema.optional(),
       })
       .parse(req.body);
     const idempotencyKey = readIdempotencyKey(req.headers);
@@ -211,7 +222,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
   });
 
   // -- withdraw ---------------------------------------------------------------
-  app.post("/groups/:id/treasury/withdraw", async (req) => {
+  app.post("/groups/:id/treasury/withdraw", rateLimited("settlementCreate"), async (req) => {
     const auth = requireUser(req);
     const { id } = z.object({ id: z.string() }).parse(req.params);
     await requireAdmin(id, auth.id);
@@ -221,6 +232,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
         assetCode: z.string().min(1),
         assetIssuer: z.string().nullable().optional(),
         destination: z.string(),
+        validitySeconds: intentValiditySchema.optional(),
       })
       .parse(req.body);
     const idempotencyKey = readIdempotencyKey(req.headers);
@@ -287,7 +299,10 @@ export default async function treasuryRoutes(app: FastifyInstance) {
   });
 
   // -- confirm treasury tx ----------------------------------------------------
-  app.post("/treasury-transactions/:id/confirm", async (req) => {
+  // Submitting a signed treasury envelope validates it and pushes it to
+  // Horizon, so it gets its own budget rather than sharing one with the
+  // treasury read routes — or with settlement submission.
+  app.post("/treasury-transactions/:id/confirm", rateLimited("treasurySubmit"), async (req) => {
     const auth = requireUser(req);
     const { id } = z.object({ id: z.string() }).parse(req.params);
     const body = z.object({ signedXdr: z.string().min(1) }).parse(req.body);
@@ -312,6 +327,11 @@ export default async function treasuryRoutes(app: FastifyInstance) {
       return { treasuryTransaction: serializeTreasuryTx(ttx) };
     }
 
+    // Checked after authorization (so a stranger learns nothing from the
+    // difference) but before anything is sent upstream: an expired intent must
+    // never be submitted to Horizon.
+    assertIntentNotExpired(ttx.expiresAt, "treasury transaction");
+
     const source =
       ttx.direction === "deposit"
         ? auth.stellarPublicKey
@@ -329,6 +349,11 @@ export default async function treasuryRoutes(app: FastifyInstance) {
         asset: { code: ttx.assetCode, issuer: ttx.assetIssuer },
         amount: ttx.amount.toString(),
         memoCode: ttx.shortCode,
+        // submitPayment re-validates the envelope's own time bounds against the
+        // stored intent, so a stale signature is rejected locally rather than
+        // by Horizon.
+        expiresAt: ttx.expiresAt,
+        resource: "treasury transaction",
       });
     } catch (e) {
       await prisma.treasuryTransaction.update({
@@ -417,48 +442,20 @@ export default async function treasuryRoutes(app: FastifyInstance) {
   // -- history ----------------------------------------------------------------
   app.get("/groups/:id/treasury/history", async (req) => {
     const auth = requireUser(req);
-    const { id: groupId } = z.object({ id: z.string() }).parse(req.params);
-    const { cursor, limit } = paginationQuerySchema.parse(req.query ?? {});
+    const { id: groupId } = z.object({ id: z.string().min(1).max(64) }).parse(req.params);
+    const { cursor, limit, order } = paginationQuerySchema.parse(req.query ?? {});
     await requireMembership(groupId, auth.id);
 
-    let decodedCursor = null;
-    if (cursor) {
-      decodedCursor = decodeCursor(cursor);
-      if (!decodedCursor) {
-        throw Errors.badRequest("invalid_cursor", "The provided cursor is invalid");
-      }
-    }
+    const position = requireCursor(cursor);
 
     const transactions = await prisma.treasuryTransaction.findMany({
-      where: {
-        groupId,
-        ...(decodedCursor && {
-          OR: [
-            { createdAt: { lt: decodedCursor.createdAt } },
-            {
-              createdAt: decodedCursor.createdAt,
-              id: { lt: decodedCursor.id },
-            },
-          ],
-        }),
-      },
+      where: { groupId, ...cursorFilter(position, order) },
       include: { user: true },
-      orderBy: [{ createdAt: "desc" }, { id: "desc" }],
-      take: limit + 1,
+      orderBy: cursorOrderBy(order),
+      take: takeForPage(limit),
     });
 
-    const hasMore = transactions.length > limit;
-    const results = hasMore ? transactions.slice(0, limit) : transactions;
-    const nextCursor = hasMore
-      ? encodeCursor(
-          results[results.length - 1].createdAt,
-          results[results.length - 1].id
-        )
-      : null;
-
-    return {
-      transactions: results.map(serializeTreasuryTx),
-      meta: { nextCursor, hasMore },
-    };
+    const { items, meta } = buildPage(transactions, limit, order);
+    return { transactions: items.map(serializeTreasuryTx), meta };
   });
 }

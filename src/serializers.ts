@@ -129,6 +129,7 @@ export function serializeTreasuryTx(t: any) {
     stellarTxHash: t.stellarTxHash ?? null,
     status: t.status,
     memo: t.memo ?? null,
+    expiresAt: t.expiresAt ? iso(t.expiresAt) : null,
     createdAt: iso(t.createdAt),
   };
 }

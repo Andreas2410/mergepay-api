@@ -156,6 +156,9 @@ model TreasuryTransaction {
   stellarTxHash String?  @map("stellar_tx_hash")
   status        String   @default("pending")
   memo          String?
+  // Server-controlled signing deadline for the unsigned XDR — same contract as
+  // Settlement.expiresAt. See src/lib/time-bounds.ts.
+  expiresAt     DateTime? @map("expires_at")
   createdAt     DateTime @default(now()) @map("created_at")
 
   group Group @relation(fields: [groupId], references: [id], onDelete: Cascade)
@@ -163,6 +166,7 @@ model TreasuryTransaction {
 
   @@index([groupId])
   @@index([status])
+  @@index([expiresAt])
   @@map("treasury_transactions")
 }
 
