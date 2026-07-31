@@ -34,7 +34,6 @@ export default async function treasuryRoutes(app: FastifyInstance) {
   app.post("/groups/:id/treasury/enable", async (req) => {
     const auth = requireUser(req);
     const { id } = z.object({ id: z.string() }).parse(req.params);
-    await requireAdmin(id, auth.id);
     const body = z
       .object({
         publicKey: z.string(),
@@ -56,19 +55,25 @@ export default async function treasuryRoutes(app: FastifyInstance) {
       }
     }
 
-    const group = await prisma.group.update({
-      where: { id },
-      data: {
-        treasuryEnabled: true,
-        treasuryAccountPublicKey: body.publicKey,
-        treasuryRequiredSigners: body.requiredSigners ?? 1,
-      },
-    });
-    await audit({
-      userId: auth.id,
-      action: "treasury.enable",
-      entityType: "group",
-      entityId: id,
+    // The admin check and the update happen in one transaction so a
+    // concurrent demotion/removal of `auth.id` can't bypass authorization.
+    const group = await prisma.$transaction(async (tx) => {
+      await requireAdmin(id, auth.id, tx);
+      const updated = await tx.group.update({
+        where: { id },
+        data: {
+          treasuryEnabled: true,
+          treasuryAccountPublicKey: body.publicKey,
+          treasuryRequiredSigners: body.requiredSigners ?? 1,
+        },
+      });
+      await auditTx(tx, {
+        userId: auth.id,
+        action: "treasury.enable",
+        entityType: "group",
+        entityId: id,
+      });
+      return updated;
     });
     return { group: serializeGroup(group) };
   });
@@ -153,7 +158,6 @@ export default async function treasuryRoutes(app: FastifyInstance) {
   app.post("/groups/:id/treasury/deposit", rateLimited("settlementCreate"), async (req) => {
     const auth = requireUser(req);
     const { id } = z.object({ id: z.string() }).parse(req.params);
-    await requireMembership(id, auth.id);
     const body = z
       .object({
         amount: z.string().min(1),
@@ -225,7 +229,6 @@ export default async function treasuryRoutes(app: FastifyInstance) {
   app.post("/groups/:id/treasury/withdraw", rateLimited("settlementCreate"), async (req) => {
     const auth = requireUser(req);
     const { id } = z.object({ id: z.string() }).parse(req.params);
-    await requireAdmin(id, auth.id);
     const body = z
       .object({
         amount: z.string().min(1),
