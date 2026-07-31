@@ -183,6 +183,10 @@ export const anchorService = {
     return value;
   },
 
+  async getAnchorConfig(): Promise<AnchorToml> {
+    return this.getToml(config.ANCHOR_HOME_DOMAIN);
+  },
+
   /** Step 1: get a SEP-10 challenge from the anchor for the user account. */
   async getChallenge(
     webAuthEndpoint: string,
@@ -214,7 +218,7 @@ export const anchorService = {
     return parseJson(tokenResponseSchema, await res.json()).token;
   },
 
-  /** Step 3: start a SEP-24 interactive deposit/withdraw. */
+  /** Start a SEP-24 interactive deposit or withdrawal flow. */
   async startInteractive(params: {
     transferServer: string;
     token: string;
