@@ -139,17 +139,21 @@ export const anchorService = {
     const cached = tomlCache.get(homeDomain);
     if (cached && Date.now() - cached.at < TOML_TTL) return cached.value;
 
+    const provider = `toml:${homeDomain}`;
+    if (anchorCircuit.isOpen(provider)) {
+      throw new RetryableError(`Circuit open for anchor ${homeDomain}`, "ANCHOR_CIRCUIT_OPEN", config.ANCHOR_CIRCUIT_COOLDOWN_MS);
+    }
+
     const url = `https://${homeDomain}/.well-known/stellar.toml`;
     const res = await fetchWithTimeout(url, "Anchor.getToml", config.ANCHOR_TOML_TIMEOUT_MS);
     if (!res.ok) {
-      throw Errors.upstream(`Could not load stellar.toml for ${homeDomain}`);
+      throw new RetryableError(`Could not load stellar.toml for ${homeDomain}`, "ANCHOR_UPSTREAM");
     }
-
     let parsed: any;
     try {
       parsed = toml.parse(await res.text());
     } catch {
-      throw Errors.upstream("Anchor returned invalid stellar.toml");
+      throw new RetryableError("Anchor returned invalid stellar.toml", "ANCHOR_MALFORMED");
     }
 
     const currencies = Array.isArray(parsed.CURRENCIES) ? parsed.CURRENCIES : [];
@@ -165,7 +169,7 @@ export const anchorService = {
       typeof parsed.TRANSFER_SERVER_SEP0024 !== "string" ||
       typeof parsed.SIGNING_KEY !== "string"
     ) {
-      throw Errors.upstream("Anchor stellar.toml is missing required SEP-24 fields");
+      throw new RetryableError("Anchor stellar.toml is missing required SEP-24 fields", "ANCHOR_MALFORMED");
     }
 
     const value: AnchorToml = {
@@ -251,6 +255,11 @@ export const anchorService = {
     token: string;
     id: string;
   }): Promise<string | null> {
+    const provider = `tx:${params.transferServer}`;
+    if (anchorCircuit.isOpen(provider)) {
+      return null;
+    }
+
     const url = `${params.transferServer}/transaction?id=${encodeURIComponent(
       params.id
     )}`;
@@ -258,18 +267,24 @@ export const anchorService = {
     try {
       res = await fetchWithTimeout(url, "Anchor.getTransactionStatus", config.ANCHOR_POLL_TIMEOUT_MS, {
         headers: { Authorization: `Bearer ${params.token}` },
-      });
+      }), 10_000);
+      anchorCircuit.recordSuccess(provider);
     } catch {
+      anchorCircuit.recordFailure(provider);
       return null;
     }
 
-    if (!res.ok) return null;
+    if (!res.ok) {
+      anchorCircuit.recordFailure(provider);
+      return null;
+    }
 
     try {
       const data = parseJson(sep24TransactionResponseSchema, await res.json());
       const rawStatus = data.transaction?.status;
       return rawStatus ? rawStatus.trim().toLowerCase() : null;
     } catch {
+      anchorCircuit.recordFailure(provider);
       return null;
     }
   },
@@ -288,59 +303,12 @@ export const anchorService = {
     timeoutMs?: number;
   }): Promise<PollResult> {
     const timeoutMs = params.timeoutMs ?? DEFAULT_POLL_TIMEOUT_MS;
-    const url = `${params.transferServer}/transaction?id=${encodeURIComponent(
-      params.id
-    )}`;
-
-    let response: Response;
-    try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), timeoutMs);
-      try {
-        response = await fetch(url, {
-          headers: { Authorization: `Bearer ${params.token}` },
-          signal: controller.signal,
-        });
-      } finally {
-        clearTimeout(timer);
-      }
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err);
+    const provider = `tx:${params.transferServer}`;
+    if (anchorCircuit.isOpen(provider)) {
       return {
         rawStatus: null,
         status: "pending_anchor",
-        message: `Anchor poll failed: ${message}`,
-        isError: true,
-      };
-    }
-
-    if (!response.ok) {
-      return {
-        rawStatus: null,
-        status: "pending_anchor",
-        message: `Anchor returned HTTP ${response.status}`,
-        isError: true,
-      };
-    }
-
-    let json: Record<string, unknown>;
-    try {
-      json = (await response.json()) as Record<string, unknown>;
-    } catch {
-      return {
-        rawStatus: null,
-        status: "pending_anchor",
-        message: "Anchor returned malformed (non-JSON) response",
-        isError: true,
-      };
-    }
-
-    const tx = json.transaction as Record<string, unknown> | undefined;
-    if (!tx) {
-      return {
-        rawStatus: null,
-        status: "pending_anchor",
-        message: "Anchor response missing 'transaction' field",
+        message: "Anchor circuit is open",
         isError: true,
       };
     }
