@@ -53,7 +53,7 @@ vi.mock("../src/services/stellar", async (importActual) => {
   };
 });
 
-import { buildChallenge, verifyChallenge } from "../src/services/sep10";
+import { buildChallenge, verifyChallenge, cleanupExpiredChallenges, serverKeypair } from "../src/services/sep10";
 import { config } from "../src/config";
 
 describe("SEP-10 challenge / verify", () => {

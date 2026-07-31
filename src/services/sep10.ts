@@ -9,8 +9,6 @@
  * support so different client tiers can get different validity windows.
  */
 
-import { createHash } from "node:crypto";
-import { Prisma } from "@prisma/client";
 import { Keypair, WebAuth, Transaction } from "@stellar/stellar-sdk";
 import { config } from "../config";
 import { prisma } from "../db";
@@ -234,11 +232,21 @@ export async function verifyChallenge(signedXdr: string): Promise<string> {
     invalidChallenge();
   }
 
+  // 1. Verify Time Bounds (Expiration)
+  const nowSec = Math.floor(Date.now() / 1000);
+  const minTime = parseInt(tx.timeBounds?.minTime ?? "0", 10);
+  const maxTime = parseInt(tx.timeBounds?.maxTime ?? "0", 10);
+
+  if ((minTime > 0 && nowSec < minTime) || (maxTime > 0 && nowSec > maxTime)) {
+    throw Errors.badRequest("challenge_expired", "Challenge transaction has expired");
+  }
+
+  // 2. Verify Signatures & Account Thresholds FIRST (prevents invalid signatures from consuming challenges)
   let snapshot;
   try {
     snapshot = await stellar.loadAccount(clientAccountId);
-  } catch {
-    invalidChallenge();
+  } catch (e: any) {
+    throw Errors.badRequest("invalid_challenge", e?.message ?? "Invalid challenge");
   }
 
   try {
@@ -290,6 +298,18 @@ export async function verifyChallenge(signedXdr: string): Promise<string> {
   }
 
   return clientAccountId;
+}
+
+/** Delete expired challenge records from the database. */
+export async function cleanupExpiredChallenges(): Promise<number> {
+  const result = await prisma.sep10Challenge.deleteMany({
+    where: {
+      expiresAt: {
+        lt: new Date(),
+      },
+    },
+  });
+  return result.count;
 }
 
 /** Validate the structure of a transaction XDR string (used in tests). */
