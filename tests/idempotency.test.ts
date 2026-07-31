@@ -264,4 +264,44 @@ describe("idempotency — confirm endpoint", () => {
     expect(res.statusCode).toBe(403);
     expect(prisma.settlement.update).not.toHaveBeenCalled();
   });
+
+  it("does not clobber a settlement a concurrent confirm already transitioned", async () => {
+    // Two confirms both read status "pending", but only the guarded
+    // updateMany(WHERE status = 'pending') actually matches for the winner.
+    prisma.settlement.findUnique.mockResolvedValue(fakeSettlement());
+    prisma.settlement.updateMany.mockResolvedValue({ count: 0 });
+    prisma.settlement.findUniqueOrThrow.mockResolvedValue(
+      fakeSettlement({ status: "submitted", transactionXdr: "WINNER..." })
+    );
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/settlements/settle_1/confirm",
+      headers: authHeader(),
+      payload: { signedXdr: "LOSER..." },
+    });
+
+    expect(res.statusCode).toBe(200);
+    // The winner's status is returned; our own "LOSER..." XDR never applied
+    // (the guarded updateMany matched zero rows), and we never re-audit a
+    // transition we didn't actually make.
+    expect(res.json().settlement.status).toBe("submitted");
+    expect(prisma.auditLog.create).not.toHaveBeenCalled();
+  });
+
+  it("rejects confirmation from a user who does not own the settlement", async () => {
+    prisma.settlement.findUnique.mockResolvedValue(
+      fakeSettlement({ fromUserId: "someone_else" })
+    );
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/settlements/settle_1/confirm",
+      headers: authHeader(),
+      payload: { signedXdr },
+    });
+
+    expect(res.statusCode).toBe(403);
+    expect(prisma.settlement.updateMany).not.toHaveBeenCalled();
+  });
 });
