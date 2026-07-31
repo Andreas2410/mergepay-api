@@ -18,6 +18,7 @@ const h = vi.hoisted(() => {
   const anchorSession = {
     findMany: vi.fn(),
     update: vi.fn(),
+    updateMany: vi.fn(),
   };
   const auditLog = { create: vi.fn() };
   const prisma: any = {
@@ -82,7 +83,7 @@ vi.mock("../src/services/anchor", () => ({
   ]),
 }));
 
-import { processSubmittedSettlements, reconcileAnchors } from "../src/worker/index";
+import { processSubmittedSettlements, reconcileAnchors, setDelayFn, SETTLEMENT_MAX_RETRIES } from "../src/worker/index";
 import { anchorService } from "../src/services/anchor";
 
 function mockAnchorService() {
@@ -143,6 +144,7 @@ describe("reconcileAnchors", () => {
     status: "pending_anchor",
     retryCount: 0,
     failureReason: null,
+    nextRetryAt: null,
     lastPolledAt: null,
     createdAt: new Date("2026-07-25T00:00:00.000Z"),
     updatedAt: new Date("2026-07-25T00:00:00.000Z"),
@@ -150,7 +152,9 @@ describe("reconcileAnchors", () => {
 
   beforeEach(() => {
     h.prisma.anchorSession.update.mockReset();
+    h.prisma.anchorSession.updateMany.mockReset();
     h.prisma.anchorSession.update.mockResolvedValue({});
+    h.prisma.anchorSession.updateMany.mockResolvedValue({ count: 1 });
   });
 
   it("discovers pending sessions and polls them", async () => {
@@ -168,6 +172,8 @@ describe("reconcileAnchors", () => {
           lastPolledAt: expect.any(Date),
           failureReason: null,
           retryCount: 0,
+          errorCategory: null,
+          nextRetryAt: null,
         }),
       })
     );
@@ -322,11 +328,18 @@ describe("processSubmittedSettlements", () => {
       .mockResolvedValueOnce("hash_456");
     h.getTransaction.mockResolvedValue({ successful: true });
 
-    const promise = processSubmittedSettlements();
-    await vi.runAllTimersAsync();
-    await promise;
+    // Use fake timers to control delay
+    const delays: number[] = [];
+    setDelayFn((ms: number) => {
+      delays.push(ms);
+      return Promise.resolve();
+    });
+
+    await processSubmittedSettlements();
 
     expect(h.submitPayment).toHaveBeenCalledTimes(3);
+    // Verify exponential backoff (should increase)
+    expect(delays[1]).toBeGreaterThan(delays[0]);
     expect(h.prisma.settlement.update).toHaveBeenCalledWith(
       expect.objectContaining({
         where: { id: "settle_2" },
@@ -343,18 +356,20 @@ describe("processSubmittedSettlements", () => {
     setupSettlement({ status: "submitted" });
     h.submitPayment.mockRejectedValue(new Error("timeout"));
 
-    const promise = processSubmittedSettlements();
-    await vi.runAllTimersAsync();
-    await promise;
+    setDelayFn(() => Promise.resolve());
 
-    expect(h.submitPayment).toHaveBeenCalledTimes(4);
+    await processSubmittedSettlements();
+
+    expect(h.submitPayment).toHaveBeenCalledTimes(SETTLEMENT_MAX_RETRIES);
+    // The final update should mark it as failed with permanent category (retries exhausted)
     expect(h.prisma.settlement.update).toHaveBeenCalledWith(
       expect.objectContaining({
         where: { id: "settle_3" },
         data: expect.objectContaining({
           status: "failed",
           failureReason: expect.any(String),
-          retryCount: { increment: 1 },
+          errorCategory: "permanent", // Retries exhausted = permanent failure
+          nextRetryAt: null,
         }),
       })
     );
@@ -364,9 +379,9 @@ describe("processSubmittedSettlements", () => {
     setupSettlement({ status: "submitted" });
     h.submitPayment.mockRejectedValue(new Error("invalid signature"));
 
-    const promise = processSubmittedSettlements();
-    await vi.runAllTimersAsync();
-    await promise;
+    setDelayFn(() => Promise.resolve());
+
+    await processSubmittedSettlements();
 
     expect(h.submitPayment).toHaveBeenCalledTimes(1);
     expect(currentSettlementState?.status).toBe("failed");

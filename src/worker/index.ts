@@ -41,6 +41,8 @@ interface SettlementSubmissionRecord {
   expenseShareId: string | null;
   retryCount: number;
   status: string;
+  nextRetryAt: Date | null;
+  errorCategory: string | null;
   createdAt: Date;
 }
 
@@ -61,8 +63,15 @@ class PermanentSettlementError extends Error {
   }
 }
 
-async function sleep(ms: number): Promise<void> {
-  await new Promise<void>((resolve) => setTimeout(resolve, ms));
+/** Calculate exponential backoff delay with jitter */
+function calculateBackoff(attempt: number): number {
+  const exponentialDelay = Math.min(
+    BASE_RETRY_DELAY_MS * Math.pow(2, attempt - 1),
+    MAX_RETRY_DELAY_MS
+  );
+  // Add jitter: ±25% of the delay
+  const jitter = exponentialDelay * 0.25 * (Math.random() * 2 - 1);
+  return Math.max(BASE_RETRY_DELAY_MS, exponentialDelay + jitter);
 }
 
 function safeErrorMessage(error: unknown): string {
@@ -86,6 +95,15 @@ async function claimSettlement(settlement: SettlementSubmissionRecord): Promise<
       id: settlement.id,
       status: { in: ["submitted", "verifying"] },
       retryCount: settlement.retryCount,
+      OR: [
+        { nextRetryAt: null },
+        { nextRetryAt: { lte: now } },
+      ],
+    },
+    data: {
+      retryCount: { increment: 1 },
+      nextRetryAt: null,
+      errorCategory: null,
     },
   });
 
@@ -336,6 +354,38 @@ export async function processSettlements(): Promise<void> {
 }
 
 /**
+ * Claim an anchor session using optimistic locking.
+ */
+async function claimAnchorSession(
+  session: { id: string; retryCount: number; nextRetryAt: Date | null }
+): Promise<boolean> {
+  const now = new Date();
+  
+  // Skip if not yet ready for retry
+  if (session.nextRetryAt && session.nextRetryAt > now) {
+    return false;
+  }
+
+  const result = await prisma.anchorSession.updateMany({
+    where: {
+      id: session.id,
+      retryCount: session.retryCount,
+      OR: [
+        { nextRetryAt: null },
+        { nextRetryAt: { lte: now } },
+      ],
+    },
+    data: {
+      retryCount: { increment: 1 },
+      nextRetryAt: null,
+      errorCategory: null,
+    },
+  });
+
+  return result.count === 1;
+}
+
+/**
  * Poll a single anchor session and advance its status.
  */
 async function reconcileSingleAnchor(
@@ -346,6 +396,7 @@ async function reconcileSingleAnchor(
     status: string;
     retryCount: number;
     failureReason: string | null;
+    nextRetryAt: Date | null;
   },
   transferServer: string,
   ctx?: CorrelationContext
@@ -359,6 +410,12 @@ async function reconcileSingleAnchor(
     );
     return;
   }
+
+  // Try to claim the session
+  if (!(await claimAnchorSession(session))) {
+    return; // Another worker claimed it or not ready for retry
+  }
+
   const result: PollResult = await anchorService.pollTransaction({
     transferServer,
     token: session.anchorToken!,
@@ -366,16 +423,18 @@ async function reconcileSingleAnchor(
   });
 
   const now = new Date();
+  const currentRetryCount = session.retryCount + 1;
 
   // ── Handle poll errors (timeout, network, malformed) ─────────────────
   if (result.isError) {
-    const nextRetryCount = session.retryCount + 1;
-    const shouldBackoff = nextRetryCount <= ANCHOR_MAX_RETRIES;
+    const shouldBackoff = currentRetryCount <= ANCHOR_MAX_RETRIES;
+    const category = ErrorCategory.TRANSIENT; // Poll errors are typically transient
 
     const data: Record<string, unknown> = {
       lastPolledAt: now,
-      retryCount: shouldBackoff ? nextRetryCount : session.retryCount,
+      retryCount: currentRetryCount,
       failureReason: result.message,
+      errorCategory: category,
     };
 
   const sessions = await model.findMany({
@@ -419,6 +478,9 @@ async function reconcileSingleAnchor(
       data: {
         lastPolledAt: now,
         failureReason: null, // clear transient errors if poll succeeds
+        errorCategory: null,
+        nextRetryAt: null,
+        retryCount: 0, // reset on successful poll
       },
     });
     return;
@@ -446,6 +508,8 @@ async function reconcileSingleAnchor(
     lastPolledAt: now,
     failureReason: result.status === "error" ? (result.message ?? null) : null,
     retryCount: 0, // reset on successful poll
+    errorCategory: null,
+    nextRetryAt: null,
   };
 
   if (result.stellarTransactionHash) {
@@ -536,6 +600,8 @@ export async function processSubmittedSettlements(): Promise<void> {
       expenseShareId: row.expenseShareId,
       retryCount: row.retryCount,
       status: row.status,
+      nextRetryAt: row.nextRetryAt,
+      errorCategory: row.errorCategory,
       createdAt: row.createdAt,
     };
     const ctx = jobContext("settlement", row.id);
