@@ -1,11 +1,12 @@
 import { FastifyInstance } from "fastify";
 import { z } from "zod";
+import { Transaction } from "@stellar/stellar-sdk";
 import { prisma } from "../db";
 import { config } from "../config";
 import { Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
 import { requireMembership } from "../services/access";
-import { stellar } from "../services/stellar";
+import { stellar, validatePaymentTx } from "../services/stellar";
 import { shortCode } from "../services/codes";
 import { audit, auditTx } from "../services/audit";
 import { userOrIpKey } from "../services/rate-limit-keys";

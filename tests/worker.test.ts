@@ -85,6 +85,7 @@ vi.mock("../src/services/anchor", () => ({
 
 import { processSubmittedSettlements, reconcileAnchors, setDelayFn, SETTLEMENT_MAX_RETRIES } from "../src/worker/index";
 import { anchorService } from "../src/services/anchor";
+import { AppError } from "../src/errors";
 
 function mockAnchorService() {
   const anchorServiceMock = vi.mocked(anchorService);
@@ -385,5 +386,83 @@ describe("processSubmittedSettlements", () => {
 
     expect(h.submitPayment).toHaveBeenCalledTimes(1);
     expect(currentSettlementState?.status).toBe("failed");
+  });
+
+  it("passes the settlement's own recorded intent to submitPayment so it is re-validated before submission", async () => {
+    const settlement = {
+      id: "settle_5",
+      shortCode: "INTENT1",
+      fromUserId: "user_1",
+      toUserId: "user_2",
+      amount: "42.5000000",
+      assetCode: "USDC",
+      assetIssuer: "GISSUERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      transactionXdr: "signed-xdr-5",
+      expenseShareId: null,
+      retryCount: 0,
+      status: "submitted",
+      createdAt: new Date(),
+      from: { stellarPublicKey: "GFROMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" },
+      to: { stellarPublicKey: "GTOAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" },
+    };
+
+    h.prisma.settlement.findMany.mockResolvedValue([settlement]);
+    h.prisma.settlement.update.mockResolvedValue({ ...settlement, status: "confirmed" });
+    h.submitPayment.mockResolvedValue("hash_intent");
+
+    const promise = processSubmittedSettlements();
+    await vi.runAllTimersAsync();
+    await promise;
+
+    // Every field a malicious or buggy client-signed XDR could diverge on —
+    // asset issuer included — is passed through so submitPayment's own
+    // validatePaymentTx call actually catches a mismatch, rather than
+    // blindly relaying whatever was persisted at confirm time.
+    expect(h.submitPayment).toHaveBeenCalledWith("signed-xdr-5", {
+      sourcePublicKey: "GFROMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      destination: "GTOAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      asset: { code: "USDC", issuer: "GISSUERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" },
+      amount: "42.5000000",
+      memoCode: "INTENT1",
+    });
+  });
+
+  it("treats an XDR intent mismatch as permanent and does not retry", async () => {
+    const settlement = {
+      id: "settle_6",
+      shortCode: "MISMATCH1",
+      fromUserId: "user_1",
+      toUserId: "user_2",
+      amount: "5.00",
+      assetCode: "USDC",
+      assetIssuer: null,
+      transactionXdr: "signed-xdr-6",
+      expenseShareId: null,
+      retryCount: 0,
+      status: "submitted",
+      createdAt: new Date(),
+      from: { stellarPublicKey: "GFROMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" },
+      to: { stellarPublicKey: "GTOAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" },
+    };
+
+    h.prisma.settlement.findMany.mockResolvedValue([settlement]);
+    // Simulate validatePaymentTx rejecting the stored XDR — a controlled
+    // AppError, exactly like the real service throws.
+    h.submitPayment.mockRejectedValue(new AppError(400, "XDR_MISMATCH", "Payment destination does not match"));
+
+    const promise = processSubmittedSettlements();
+    await vi.runAllTimersAsync();
+    await promise;
+
+    // A rejected AppError (4xx, not 429) is classified as permanent by
+    // isPermanentSettlementFailure, so the worker must not burn retries on
+    // an XDR that will never become valid.
+    expect(h.submitPayment).toHaveBeenCalledTimes(1);
+    expect(h.prisma.settlement.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: "settle_6" },
+        data: expect.objectContaining({ status: "failed" }),
+      })
+    );
   });
 });
