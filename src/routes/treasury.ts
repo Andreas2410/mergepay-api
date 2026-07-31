@@ -341,6 +341,13 @@ export default async function treasuryRoutes(app: FastifyInstance) {
       ttx.direction === "deposit"
         ? group.treasuryAccountPublicKey
         : ttx.destination!;
+    const intent = {
+      sourcePublicKey: source,
+      destination,
+      asset: { code: ttx.assetCode, issuer: ttx.assetIssuer },
+      amount: ttx.amount.toString(),
+      memoCode: ttx.shortCode,
+    };
 
     let hash: string;
     try {
