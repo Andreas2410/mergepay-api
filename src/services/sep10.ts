@@ -32,6 +32,31 @@ const testConsumedChallenges = new Map<string, number>();
 
 let _serverKeypair: Keypair | null = null;
 
+const CHALLENGE_TIMEOUT_SECONDS = 300;
+
+// Single-use guard against challenge replay: once a signed challenge has been
+// used to mint a token, the same signed transaction cannot be replayed to
+// authenticate again. Keyed by transaction hash, pruned lazily by expiry.
+// Note: this is in-memory and per-process — a multi-instance deployment
+// needs a shared store (e.g. Redis) for this guarantee to hold across nodes.
+const usedChallenges = new Map<string, number>();
+
+function pruneUsedChallenges(now: number): void {
+  for (const [hash, expiresAt] of usedChallenges) {
+    if (expiresAt <= now) usedChallenges.delete(hash);
+  }
+}
+
+function consumeChallengeOnce(tx: Transaction): void {
+  const hash = tx.hash().toString("hex");
+  const now = Date.now();
+  pruneUsedChallenges(now);
+  if (usedChallenges.has(hash)) {
+    throw Errors.unauthorized();
+  }
+  usedChallenges.set(hash, now + CHALLENGE_TIMEOUT_SECONDS * 1000);
+}
+
 export function serverKeypair(): Keypair {
   if (_serverKeypair) return _serverKeypair;
   if (config.SEP10_SIGNING_SECRET) {
@@ -70,6 +95,7 @@ export function buildChallenge(account: string): {
     serverKeypair(),
     account,
     config.SEP10_HOME_DOMAIN,
+    CHALLENGE_TIMEOUT_SECONDS,
     CHALLENGE_VALIDITY_SECONDS,
     config.networkPassphrase,
     config.WEB_AUTH_DOMAIN
@@ -178,10 +204,17 @@ async function consumeChallenge(id: string, expiresAt: Date): Promise<void> {
 /**
  * Verify a signed challenge. Returns the authenticated client public key.
  * Handles unfunded accounts by verifying against the account's master key.
+ *
+ * Rejects expired, malformed, incorrectly signed, wrong-network, and
+ * wrong-domain transactions, and rejects replays of an already-consumed
+ * challenge. Failure messages are intentionally generic — the underlying
+ * SDK/network error is never echoed back to the caller, and neither the
+ * challenge XDR nor any signed payload is logged.
  */
 export async function verifyChallenge(signedXdr: string): Promise<string> {
   let tx: Transaction;
   let clientAccountId: string;
+  let tx: Transaction;
 
   try {
     tx = new Transaction(signedXdr, config.networkPassphrase);
@@ -193,6 +226,9 @@ export async function verifyChallenge(signedXdr: string): Promise<string> {
       config.WEB_AUTH_DOMAIN
     );
     clientAccountId = read.clientAccountID;
+    tx = read.tx;
+  } catch {
+    throw Errors.unauthorized();
     validateChallengeEnvelope(tx, clientAccountId);
   } catch {
     invalidChallenge();
@@ -232,6 +268,10 @@ export async function verifyChallenge(signedXdr: string): Promise<string> {
       );
     }
   } catch {
+    throw Errors.unauthorized();
+  }
+
+  consumeChallengeOnce(tx);
     invalidChallenge();
   }
 
