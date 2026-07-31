@@ -41,6 +41,18 @@ vi.mock("../src/services/stellar", () => ({
   })),
 }));
 
+const idem = vi.hoisted(() => ({
+  claim: vi.fn(),
+  complete: vi.fn(),
+  fail: vi.fn(),
+}));
+
+vi.mock("../src/services/idempotency", () => ({
+  claimIdempotencyKey: idem.claim,
+  completeIdempotencyKey: idem.complete,
+  failIdempotencyKey: idem.fail,
+}));
+
 import { buildApp } from "../src/app";
 import { signToken } from "../src/plugins/auth";
 
@@ -91,10 +103,29 @@ function authHeader(user = fakeUser()) {
   return { authorization: `Bearer ${token}` };
 }
 
+function expectedHash(settlement: ReturnType<typeof fakeSettlement>, signedXdr: string): string {
+  return crypto
+    .createHash("sha256")
+    .update(
+      JSON.stringify({
+        settlementId: settlement.id,
+        amount: settlement.amount.toString(),
+        assetCode: settlement.assetCode,
+        assetIssuer: settlement.assetIssuer,
+        fromUserId: settlement.fromUserId,
+        toUserId: settlement.toUserId,
+        memo: settlement.memo,
+        signedXdr,
+      })
+    )
+    .digest("hex");
+}
+
 let app: Awaited<ReturnType<typeof buildApp>>;
 
 beforeEach(async () => {
   vi.clearAllMocks();
+  idem.claim.mockResolvedValue({ outcome: "claimed", id: "idem_1" });
   if (!app) app = await buildApp();
 });
 
@@ -114,10 +145,7 @@ describe("idempotency — confirm endpoint", () => {
     const res = await app.inject({
       method: "POST",
       url: "/settlements/settle_1/confirm",
-      headers: {
-        ...authHeader(),
-        "idempotency-key": "key-001",
-      },
+      headers: { ...authHeader(), "idempotency-key": "key-001" },
       payload: { signedXdr },
     });
 
@@ -196,6 +224,15 @@ describe("idempotency — confirm endpoint", () => {
       responseJson: JSON.stringify({ settlement: { status: "submitted" } }),
       expiresAt: new Date(Date.now() + 60_000),
     });
+
+    expect(res.statusCode).toBe(409);
+    expect(res.json().error).toBe("IDEMPOTENCY_CONFLICT");
+    expect(prisma.settlement.update).not.toHaveBeenCalled();
+  });
+
+  it("returns 409 IDEMPOTENCY_IN_PROGRESS for a concurrent request under the same key", async () => {
+    prisma.settlement.findUnique.mockResolvedValue(fakeSettlement());
+    idem.claim.mockResolvedValueOnce({ outcome: "in_progress" });
 
     const res = await app.inject({
       method: "POST",
