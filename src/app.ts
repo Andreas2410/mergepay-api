@@ -255,6 +255,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(withdrawalRoutes);
   await app.register(historyRoutes);
   await app.register(uploadRoutes);
+  await app.register(userGroupsRoutes);
 
   return app;
 }
