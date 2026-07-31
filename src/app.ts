@@ -87,7 +87,7 @@ export async function buildApp(): Promise<FastifyInstance> {
               ? { target: "pino-pretty", options: { colorize: true } }
               : undefined,
         },
-    bodyLimit: config.MULTIPART_FILE_SIZE_BYTES + 64 * 1024,
+    bodyLimit: config.JSON_BODY_LIMIT_BYTES,
   });
 
   app.addHook("onRequest", async (request, reply) => {
@@ -156,8 +156,8 @@ export async function buildApp(): Promise<FastifyInstance> {
   // blocking all traffic. The default "memory" store is per-process and
   // needs no failure handling of its own.
   await app.register(rateLimit, {
-    max: 100,
-    timeWindow: config.RATE_LIMIT_WINDOW_MS,
+    max: config.RATE_LIMIT_GLOBAL_MAX,
+    timeWindow: config.RATE_LIMIT_GLOBAL_WINDOW_MS,
     keyGenerator: securityKey,
     addHeaders: { "x-ratelimit-limit": true, "x-ratelimit-remaining": true, "x-ratelimit-reset": true, "retry-after": true } as any,
     errorResponseBuilder: (request) => ({
@@ -169,8 +169,8 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(multipart, {
     limits: {
       fileSize: config.MULTIPART_FILE_SIZE_BYTES,
-      files: 1,
-      parts: 10,
+      files: config.MULTIPART_MAX_FILES,
+      parts: config.MULTIPART_MAX_FIELDS,
     },
   });
 
@@ -196,7 +196,7 @@ export async function buildApp(): Promise<FastifyInstance> {
 
   app.addHook("onRoute", (routeOptions) => {
     const url = routeOptions.url;
-    let max: number | undefined;
+    let rateLimit: { max: number; timeWindow: number } | undefined;
     let bodyLimit: number | undefined;
 
     if (url === "/auth/challenge" || url === "/auth/verify") {

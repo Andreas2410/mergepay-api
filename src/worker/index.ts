@@ -114,7 +114,10 @@ async function claimSettlement(settlement: SettlementSubmissionRecord): Promise<
   return true;
 }
 
-async function releaseSettlementClaim(id: string): Promise<void> {
+async function releaseSettlementClaim(
+  id: string,
+  nextRetryDelayMs?: number
+): Promise<void> {
   claimedSettlements.delete(id);
   if (!isShuttingDown) {
     await prisma.settlement.updateMany({
@@ -613,6 +616,13 @@ export async function processSubmittedSettlements(): Promise<void> {
 }
 
 export async function runWorkerCycle(): Promise<void> {
+  // Recover stale jobs first (crashed workers, deployment interruptions)
+  await Promise.all([
+    recoverStaleSettlements(),
+    recoverStaleAnchorSessions(),
+  ]);
+
+  // Then process normal work
   await Promise.all([
     reconcilePending(),
     reconcileAnchors(),
