@@ -20,6 +20,7 @@ const h = vi.hoisted(() => {
   const model = () => ({
     findUnique: vi.fn(),
     findUniqueOrThrow: vi.fn(),
+    findFirst: vi.fn(),
     create: vi.fn(),
     update: vi.fn(),
     updateMany: vi.fn(),
@@ -27,6 +28,7 @@ const h = vi.hoisted(() => {
   const prisma: any = {
     settlement: model(),
     idempotencyKey: model(),
+    statusHistory: model(),
     auditLog: { create: vi.fn() },
     $transaction: vi.fn(async (arg: any) =>
       typeof arg === "function" ? arg(prisma) : Promise.all(arg)
@@ -229,7 +231,7 @@ describe("POST /settlements/:id/confirm — XDR intent validation", () => {
     });
 
     expect(res.statusCode).toBe(400);
-    expect(res.json().error).toBe("XDR_MISMATCH");
+    expect(res.json().error).toBe("XDR_MALFORMED");
     expect(prisma.settlement.updateMany).not.toHaveBeenCalled();
   });
 });
