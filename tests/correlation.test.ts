@@ -192,15 +192,6 @@ describe("loggerWithContext", () => {
   });
 
   it("creates a child logger with correlationId binding", () => {
-    const strings: string[] = [];
-    const stream = pino({
-      level: "info",
-      transport: {
-        target: "pino/file",
-        options: { destination: "/dev/null" },
-      },
-    });
-
     // Use a writable stream to capture log output
     const chunks: Buffer[] = [];
     const writable = new (require("stream").Writable)({
