@@ -215,6 +215,20 @@ export default async function treasuryRoutes(app: FastifyInstance) {
           include: { user: true },
         });
 
+        await audit({
+          userId: auth.id,
+          action: "treasury.deposit.created",
+          entityType: "treasury_transaction",
+          entityId: ttx.id,
+          outcome: "success",
+          metadata: {
+            groupId: id,
+            amount: body.amount,
+            assetCode: body.assetCode,
+            destination: treasuryKey,
+          },
+        });
+
         const account = await stellar.loadAccount(auth.stellarPublicKey);
         if (!account.exists) {
           throw Errors.badRequest("account_unfunded", "Your account is not funded yet");
@@ -294,6 +308,21 @@ export default async function treasuryRoutes(app: FastifyInstance) {
             expiresAt,
           },
           include: { user: true },
+        });
+
+        await audit({
+          userId: auth.id,
+          action: "treasury.withdrawal.created",
+          entityType: "treasury_transaction",
+          entityId: ttx.id,
+          outcome: "success",
+          metadata: {
+            groupId: id,
+            amount: body.amount,
+            assetCode: body.assetCode,
+            destination: body.destination,
+            status: ttx.status,
+          },
         });
 
         const account = await stellar.loadAccount(treasuryKey);

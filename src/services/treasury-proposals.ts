@@ -30,6 +30,7 @@ import { config } from "../config";
 import { Errors } from "../errors";
 import { prisma } from "../db";
 import { stellar } from "./stellar";
+import { audit } from "./audit";
 
 export interface CreateProposalParams {
   groupId: string;
@@ -305,6 +306,17 @@ export const treasuryProposalsService = {
       await prisma.treasuryProposal.update({
         where: { id: proposal.id },
         data: { status: STATUS.failed, failureReason: msg },
+      });
+      await audit({
+        userId: null,
+        action: "treasury.proposal.failed",
+        entityType: "treasury_proposal",
+        entityId: proposal.id,
+        outcome: "failure",
+        metadata: {
+          groupId: proposal.groupId,
+          reason: msg,
+        },
       });
       throw Errors.upstream(`Stellar rejected the multisig transaction: ${msg}`);
     }
