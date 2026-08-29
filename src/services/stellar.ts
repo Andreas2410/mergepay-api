@@ -25,16 +25,12 @@ import { config } from "../config";
 import { Errors } from "../errors";
 import { validateAssetSpec, assetConfigToSpec } from "./assets";
 import { withTimeout, TimeoutError, TransportError } from "./timeout";
-import {
-  withHorizonRetry,
-  classifyHorizonError,
-} from "./horizon-retry";
+import { logRetryAttempt, withRetry } from "./retry";
 import {
   INTENT_VALIDITY_SECONDS,
   assertTimeBoundsMatchIntent,
   readTimeBounds,
 } from "../lib/time-bounds";
-import { compareAmounts } from "../lib/money";
 
 let _servers: Horizon.Server[] | null = null;
 let activeServer = 0;
@@ -78,6 +74,32 @@ export async function withHorizonFailover<T>(operation: (horizon: Horizon.Server
 
 function logUpstreamError(e: unknown, codes: unknown): void {
   console.error("[stellar] Upstream error:", e instanceof Error ? e.message : String(e), codes ? JSON.stringify(codes) : "");
+}
+
+/**
+ * Structured sink for retry telemetry. This module has no request context to
+ * borrow a Fastify logger from — it is called from routes and from the worker
+ * alike — so attempt metadata goes to the same console channel as the upstream
+ * errors above. It carries the operation and attempt number and nothing from
+ * the upstream's response body.
+ */
+const retryLog = {
+  warn(entry: object, message: string): void {
+    console.warn(`[stellar] ${message}`, JSON.stringify(entry));
+  },
+};
+
+/**
+ * Horizon's 404, which the read helpers translate into a domain answer
+ * ("unfunded account", "transaction not visible yet") rather than an error.
+ * Recognized before retry policy runs so a legitimate absence never consumes
+ * the attempt budget.
+ */
+function isNotFound(error: unknown): boolean {
+  const candidate = error as
+    | { response?: { status?: number }; name?: string }
+    | null;
+  return candidate?.response?.status === 404 || candidate?.name === "NotFoundError";
 }
 
 export interface AssetSpec {
@@ -124,15 +146,26 @@ export interface MultisigRequirement {
 }
 
 export const stellar = {
-  /** Load an account. Returns exists=false for unfunded accounts (404). */
+  /**
+   * Load an account. Returns exists=false for unfunded accounts (404).
+   *
+   * A read, so it is retried: repeating it returns the same account or a
+   * fresher view of it, and nothing upstream is created. The 404 is a
+   * legitimate answer rather than a failure, so it short-circuits the retry
+   * loop instead of burning attempts on an account that simply is not funded.
+   */
   async loadAccount(publicKey: string): Promise<AccountSnapshot> {
     try {
-      const acct = await withTimeout(
-        "Horizon.loadAccount",
-        config.HORIZON_ACCOUNT_TIMEOUT_MS,
-        async (signal) => {
+      const acct = await withRetry(
+        {
+          operation: "Horizon.loadAccount",
+          timeoutMs: config.HORIZON_ACCOUNT_TIMEOUT_MS,
+          isExpected: isNotFound,
+          onAttemptFailed: (entry) => logRetryAttempt(retryLog, entry),
+        },
+        async () => {
           // Horizon.Server.loadAccount doesn't accept AbortSignal directly,
-          // but we wrap it so timeout still fires and rejects the promise.
+          // but the wrapper still fires and rejects the promise on timeout.
           return withHorizonFailover((horizon) => horizon.loadAccount(publicKey));
         }
       );
@@ -206,70 +239,13 @@ export const stellar = {
   },
 
   /**
-   * Validate a signed payment XDR matches an expected intent, then submit it
-   * with bounded retries and safe ambiguous-submission handling.
-   *
-   * Before each retry after an indeterminate failure (timeout, socket hangup),
-   * the transaction hash is computed deterministically from the envelope and
-   * checked against Horizon. If the transaction already applied successfully,
-   * its hash is returned without a second submission. This prevents the most
-   * dangerous class of retry: blind resubmission of a payment whose outcome
-   * is unknown.
-   *
-   * Throws AppError on permanent failure. Returns the tx hash on success.
+   * Validate a signed payment XDR matches an expected intent, then submit it.
+   * Throws AppError on mismatch or Horizon failure. Returns the tx hash.
    */
   async submitPayment(signedXdr: string, expected: PaymentExpectation): Promise<string> {
     const tx = parseSignedPaymentXdr(signedXdr, "Malformed transaction envelope");
     validatePaymentTx(tx, expected);
-
-    const txHash = tx.hash().toString("hex");
-
-    const outcome = await withHorizonRetry(
-      () => submitToHorizon(tx),
-      {
-        classify: classifyHorizonError,
-        beforeRetry: async (error) => {
-          // For indeterminate failures, check the ledger before resubmitting.
-          // The hash is deterministic from the signed envelope, so we know it
-          // without another submission.
-          if (classifyHorizonError(error) === "indeterminate") {
-            try {
-              const found = await stellar.getTransaction(txHash);
-              if (found?.successful) {
-                // Transaction already applied — return the hash without a
-                // second submission. The caller sees success as if the first
-                // attempt worked.
-                return false; // abort retry loop
-              }
-              // Not found or failed — safe to retry.
-            } catch {
-              // Horizon unreachable for the check — safe to retry; the
-              // worker's reconciliation will catch it later.
-            }
-          }
-          return true; // continue retrying
-        },
-      }
-    );
-
-    if (outcome.ok) return outcome.value;
-
-    // Convert retry-exhausted or permanent errors to the existing AppError
-    // contract so callers see the same shape they always have.
-    const error = outcome.lastError;
-    if (error instanceof TimeoutError) {
-      throw Errors.upstream(`Horizon submission timed out after ${outcome.attempts} attempt(s)`);
-    }
-    if (error instanceof TransportError) {
-      throw Errors.upstream(`Horizon submission transport error after ${outcome.attempts} attempt(s)`);
-    }
-    // Re-throw AppError as-is.
-    if (error && typeof error === "object" && "statusCode" in error && "code" in error) {
-      throw error;
-    }
-    throw Errors.upstream(
-      `Stellar rejected the transaction after ${outcome.attempts} attempt(s)`
-    );
+    return submitToHorizon(tx);
   },
 
   /**
@@ -304,6 +280,17 @@ export const stellar = {
       skipSourceSignatureCheck: true,
     });
     verifyMultisig(tx, requirement);
+    // Deliberately a single attempt here, unlike submitSigned/submitToHorizon
+    // below, which retry transient submission failures (#305). A timeout on a
+    // submission leaves the outcome genuinely unknown — Horizon may have
+    // applied the transaction and lost the response — and this is the treasury
+    // path, where the caller already holds the envelope hash. Recovery
+    // therefore belongs to the worker, which checks that deterministic hash
+    // (stellar.hashOf) against Horizon before deciding whether anything still
+    // needs submitting, rather than resubmitting blind.
+    //
+    // TimeoutError and TransportError are re-thrown unmapped below precisely so
+    // that reconciliation can tell "unknown outcome" from "Horizon rejected it".
     try {
       const res = await withTimeout(
         "Horizon.submitTransaction",
@@ -347,43 +334,35 @@ export const stellar = {
     }
   },
 
-  /** Look up a transaction by hash with bounded retries. Returns null if not yet visible. */
+  /**
+   * Look up a transaction by hash. Returns null if not yet visible.
+   *
+   * Retried for the same reason as `loadAccount`, and with the same treatment
+   * of 404: a transaction that has not reached Horizon yet is an answer the
+   * caller acts on (keep polling), not a transient fault to retry through.
+   */
   async getTransaction(
     hash: string
   ): Promise<{ successful: boolean } | null> {
-    const outcome = await withHorizonRetry(
-      async () => {
-        try {
-          const tx = await withTimeout(
-            "Horizon.getTransaction",
-            config.HORIZON_STATUS_TIMEOUT_MS,
-            async (_signal) => {
-              return withHorizonFailover((horizon) =>
-                horizon.transactions().transaction(hash).call()
-              );
-            }
-          );
-          return { successful: (tx as any).successful };
-        } catch (e: any) {
-          if (e?.response?.status === 404) return null;
-          throw e;
-        }
-      },
-      {
-        classify: (error) => {
-          // 404 is a valid "not found" response, not an error to retry.
-          if (error && typeof error === "object" && "response" in error) {
-            const status = (error as any).response?.status;
-            if (status === 404) return "permanent" as const;
-          }
-          return classifyHorizonError(error);
+    try {
+      const tx = await withRetry(
+        {
+          operation: "Horizon.getTransaction",
+          timeoutMs: config.HORIZON_STATUS_TIMEOUT_MS,
+          isExpected: isNotFound,
+          onAttemptFailed: (entry) => logRetryAttempt(retryLog, entry),
         },
-      }
-    );
-
-    if (outcome.ok) return outcome.value;
-    // If retries were exhausted, propagate the last error.
-    throw outcome.lastError;
+        async () => {
+          return withHorizonFailover((horizon) =>
+            horizon.transactions().transaction(hash).call()
+          );
+        }
+      );
+      return { successful: (tx as any).successful };
+    } catch (e: any) {
+      if (e?.response?.status === 404) return null;
+      throw e;
+    }
   },
 
   /**
@@ -656,7 +635,7 @@ function assertMatchesIntent(tx: Transaction, expected: PaymentExpectation): voi
     throw Errors.badRequest("xdr_mismatch", "Payment asset does not match");
   }
 
-  if (compareAmounts(op.amount, expected.amount) !== 0) {
+  if (normalizeAmount(op.amount) !== normalizeAmount(expected.amount)) {
     throw Errors.badRequest("xdr_mismatch", "Payment amount does not match");
   }
 
@@ -718,6 +697,12 @@ export function validatePaymentTx(tx: Transaction, expected: PaymentExpectation)
       );
     }
   }
+}
+
+function normalizeAmount(a: string): string {
+  // Compare at 7dp precision regardless of trailing zeros.
+  const [w, f = ""] = a.split(".");
+  return `${w}.${(f + "0000000").slice(0, 7)}`;
 }
 
 /**
