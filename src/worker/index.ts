@@ -82,6 +82,7 @@ import {
   jobContext,
   loggerWithContext,
 } from "../lib/correlation";
+import { jobLogger, type JobLogger } from "../lib/worker-logger";
 
 const log = pino({ name: "worker" });
 
@@ -927,7 +928,7 @@ export async function reconcileAnchors(): Promise<void> {
     // The anchor is unreachable entirely — skip the cycle rather than burning
     // every session's retry budget on the same outage.
     log.warn(
-      { jobType: "anchor", outcome: "skipped_cycle", reason: safeFailureMessage(error) },
+      { jobType: "anchor", jobId: "batch", outcome: "skipped_cycle", reason: safeFailureMessage(error) },
       "anchor TOML unavailable"
     );
     return;
@@ -998,13 +999,11 @@ export async function expireInvites(): Promise<void> {
  * the length of its own backoff.
  */
 export async function deliverPendingWebhooks(): Promise<void> {
+  const job = jobLogger("webhook_delivery", "batch", log);
   const { delivered, failed, attempted } = await processPendingWebhookDeliveries();
 
   if (attempted > 0) {
-    log.info(
-      { job: "webhook_delivery", outcome: "ok", attempted, delivered, failed },
-      "processed webhook deliveries"
-    );
+    job.log("completed", { attempted, delivered, failed });
   }
 }
 
@@ -1015,20 +1014,16 @@ export async function deliverPendingWebhooks(): Promise<void> {
  * way every other job in this cycle reports.
  */
 export async function expireStaleTreasuryProposals(): Promise<void> {
+  const job = jobLogger("treasury_proposal_expiry", "batch", log);
   const { expired, olderThan } = await expireStaleProposals();
 
   // Only speak up when something actually changed. A quiet sweep is the normal
   // case and logging it every cycle would bury the runs that mattered.
   if (expired > 0) {
-    log.info(
-      {
-        job: "treasury_proposal_expiry",
-        outcome: "ok",
-        expired,
-        olderThan: olderThan.toISOString(),
-      },
-      "expired stale treasury proposals"
-    );
+    job.log("completed", {
+      expired,
+      olderThan: olderThan.toISOString(),
+    });
   }
 }
 
@@ -1039,7 +1034,7 @@ export async function runWorkerCycle(): Promise<void> {
     WORKER_ID
   );
   if (!lease) {
-    log.debug({ outcome: "skipped_locked" }, "worker cycle already owned by another process");
+    log.debug({ jobType: "worker_cycle", outcome: "skipped_locked" }, "worker cycle already owned by another process");
     return;
   }
 
@@ -1085,7 +1080,7 @@ export async function startWorker(): Promise<() => Promise<void>> {
     try {
       await cycle;
     } catch (error) {
-      log.error({ outcome: "error", reason: safeFailureMessage(error) }, "worker cycle failed");
+      log.error({ jobType: "worker_cycle", outcome: "error", reason: safeFailureMessage(error) }, "worker cycle failed");
     } finally {
       inFlight = undefined;
     }
@@ -1105,12 +1100,12 @@ export async function startWorker(): Promise<() => Promise<void>> {
 
     const timeoutMs = Math.max(config.SHUTDOWN_TIMEOUT_MS, config.WORKER_SHUTDOWN_DRAIN_MS);
     const timeoutHandle = setTimeout(() => {
-      log.error({ signal, timeoutMs }, "shutdown timed out, forcing exit");
+      log.error({ jobType: "worker_cycle", signal, timeoutMs }, "shutdown timed out, forcing exit");
       process.exit(1);
     }, timeoutMs);
 
     try {
-      log.info({ signal, timeoutMs, outcome: "shutdown" }, "shutting down");
+      log.info({ jobType: "worker_cycle", signal, timeoutMs, outcome: "shutdown" }, "shutting down");
 
       // Wait for the running cycle, but not forever — a hung upstream must not
       // hold the process open past the deployment's grace period.
@@ -1129,7 +1124,7 @@ export async function startWorker(): Promise<() => Promise<void>> {
         // would invite a duplicate submission, so leave every lease in place and
         // let it expire; the next worker recovers it through the normal path.
         log.warn(
-          { outcome: "shutdown_drain_timeout" },
+          { jobType: "worker_cycle", outcome: "shutdown_drain_timeout" },
           "in-flight job outran the drain budget, leaving leases to expire"
         );
         return;
@@ -1149,14 +1144,15 @@ export async function startWorker(): Promise<() => Promise<void>> {
       ]);
       await prisma.$disconnect();
 
-      log.info({ signal, outcome: "shutdown_complete" }, "worker claims released");
+      log.info({ jobType: "worker_cycle", signal, outcome: "shutdown_complete" }, "worker claims released");
     } catch (error) {
-      log.error({ signal, reason: safeFailureMessage(error) }, "worker shutdown failed");
+      log.error({ jobType: "worker_cycle", signal, reason: safeFailureMessage(error) }, "worker shutdown failed");
       throw error;
     } finally {
       clearTimeout(timeoutHandle);
       process.exit(0);
     }
+
   };
 
   process.once("SIGINT", () => void shutdown("SIGINT"));
